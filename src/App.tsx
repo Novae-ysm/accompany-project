@@ -1,0 +1,657 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import ScenePanel from './components/ScenePanel'
+import ChatWindow from './components/ChatWindow'
+import InputBar from './components/InputBar'
+import AssetLibrary from './components/AssetLibrary'
+import {
+  loadMessages,
+  saveMessages,
+  clearMessages,
+  type ChatMessage,
+} from './lib/storage'
+import { sendChat } from './lib/api'
+import { type ThemeId } from './themes'
+import { translations, type Language } from './i18n'
+import {
+  loadCharacterCards,
+  saveCustomCharacterCards,
+  type CharacterCard,
+} from './characterCards'
+import type { ProfileFields } from './types'
+import { speakText, startSpeechRecognition, stopSpeechRecognition } from './voice'
+import {
+  createAsset,
+  fileToDataUrl,
+  loadCharacterImages,
+  loadBackgroundImages,
+  saveCharacterImages,
+  saveBackgroundImages,
+  type CustomAsset,
+} from './lib/assets'
+
+function buildSystemPromptFromProfile(profile: ProfileFields) {
+  return `You are ${profile.name}.
+Occupation: ${profile.occupation}.
+Personality: ${profile.personality}.
+Speech style: ${profile.speechStyle}.
+Care style: ${profile.careStyle}.
+Relationship stage: ${profile.relationship}.
+Extra notes: ${profile.extra}
+
+Always stay in character.
+Do not mention that you are an AI.
+Follow the user's language.`
+}
+
+type LLMSettings = {
+  apiKey: string
+  baseUrl: string
+  model: string
+}
+
+const SETTINGS_KEY = 'llmSettings'
+
+export default function App() {
+  const [cards, setCards] = useState<CharacterCard[]>(() => loadCharacterCards())
+
+  const [currentCharacterName, setCurrentCharacterName] = useState<string>(() => {
+    return cards[0]?.profile.name ?? 'default'
+  })
+
+  const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    return loadMessages(currentCharacterName)
+  })
+
+  const [input, setInput] = useState('')
+  const [sending, setSending] = useState(false)
+  const [typingText, setTypingText] = useState('')
+  const [typingMessageId, setTypingMessageId] = useState<string | null>(null)
+
+  const [backgroundOptions, setBackgroundOptions] = useState<string[]>([])
+  const [characterOptions, setCharacterOptions] = useState<string[]>([])
+
+  const [backgroundAssets, setBackgroundAssets] = useState<CustomAsset[]>(() => loadBackgroundImages())
+  const [characterAssets, setCharacterAssets] = useState<CustomAsset[]>(() => loadCharacterImages())
+
+  const [sceneIndex, setSceneIndex] = useState(0)
+  const [characterIndex, setCharacterIndex] = useState(0)
+  const [showProfileEditor, setShowProfileEditor] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+  const [voiceEnabled, setVoiceEnabled] = useState(false)
+  const [listening, setListening] = useState(false)
+  const [leftPanelOpen, setLeftPanelOpen] = useState(true)
+  const [rightPanelOpen, setRightPanelOpen] = useState(true)
+
+  const [llmSettings, setLlmSettings] = useState<LLMSettings>(() => {
+    const saved = localStorage.getItem(SETTINGS_KEY)
+    if (!saved) return { apiKey: '', baseUrl: '', model: '' }
+    try {
+      return JSON.parse(saved) as LLMSettings
+    } catch {
+      return { apiKey: '', baseUrl: '', model: '' }
+    }
+  })
+
+  const [theme, setTheme] = useState<ThemeId>(() => {
+    const saved = localStorage.getItem('theme') as ThemeId | null
+    const validThemes: ThemeId[] = ['warm', 'purple', 'rose', 'warmpink', 'mist']
+    return saved && validThemes.includes(saved) ? saved : 'warm'
+  })
+
+  const [language, setLanguage] = useState<Language>(() => {
+    const saved = localStorage.getItem('language') as Language | null
+    return saved ?? 'zh'
+  })
+
+  const [profile, setProfile] = useState<ProfileFields>(() => {
+    return cards[0]?.profile ?? {
+      name: '',
+      occupation: '',
+      personality: '',
+      speechStyle: '',
+      careStyle: '',
+      relationship: '',
+      extra: '',
+    }
+  })
+
+  const inputRef = useRef<HTMLInputElement>(null)
+  const chatWindowRef = useRef<HTMLDivElement>(null)
+
+  const systemPrompt = useMemo(() => buildSystemPromptFromProfile(profile), [profile])
+
+  const t = translations[language]
+
+  const currentBackgroundImage = backgroundOptions[sceneIndex] ?? ''
+  const currentCharacterImage = characterOptions[characterIndex] ?? ''
+
+  useEffect(() => {
+    inputRef.current?.focus()
+  }, [])
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('theme', theme)
+  }, [theme])
+
+  useEffect(() => {
+    localStorage.setItem('language', language)
+  }, [language])
+
+  useEffect(() => {
+    chatWindowRef.current?.scrollTo({
+      top: chatWindowRef.current.scrollHeight,
+      behavior: 'smooth',
+    })
+  }, [messages, typingText])
+
+  useEffect(() => {
+    const lastMessage = messages[messages.length - 1]
+    if (!lastMessage || lastMessage.role !== 'assistant') return
+
+    setTypingMessageId(lastMessage.id)
+    setTypingText('')
+
+    let index = 0
+    const timer = window.setInterval(() => {
+      index += 1
+      setTypingText(lastMessage.content.slice(0, index))
+
+      if (index >= lastMessage.content.length) {
+        window.clearInterval(timer)
+        setTypingMessageId(null)
+      }
+    }, 25)
+
+    return () => window.clearInterval(timer)
+  }, [messages])
+
+  useEffect(() => {
+    const lastMessage = messages[messages.length - 1]
+    if (!lastMessage || lastMessage.role !== 'assistant') return
+    speakText(lastMessage.content, voiceEnabled)
+  }, [messages, voiceEnabled])
+
+  async function handleSend() {
+    const content = input.trim()
+    if (!content || sending) return
+
+    const userMessage: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content,
+      createdAt: Date.now(),
+    }
+
+    const nextMessages = [...messages, userMessage]
+    setMessages(nextMessages)
+    saveMessages(currentCharacterName, nextMessages)
+    setInput('')
+    setSending(true)
+
+    try {
+      const reply = await sendChat(
+        [
+          { role: 'system', content: systemPrompt },
+          ...nextMessages.map((message) => ({
+            role: message.role,
+            content: message.content,
+          })),
+        ],
+        llmSettings
+      )
+
+      const assistantMessage: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: reply,
+        createdAt: Date.now(),
+      }
+
+      setMessages((current) => {
+        const updated = [...current, assistantMessage]
+        saveMessages(currentCharacterName, updated)
+        return updated
+      })
+    } catch {
+      const fallbackMessage: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: 'Sorry, I could not reach the AI service right now.',
+        createdAt: Date.now(),
+      }
+
+      setMessages((current) => {
+        const updated = [...current, fallbackMessage]
+        saveMessages(currentCharacterName, updated)
+        return updated
+      })
+    } finally {
+      setSending(false)
+      inputRef.current?.focus()
+    }
+  }
+
+  function updateProfileField(key: keyof ProfileFields, value: string) {
+    setProfile((prev) => ({ ...prev, [key]: value }))
+  }
+
+  function handleNewCharacter() {
+    setProfile({
+      name: '',
+      occupation: '',
+      personality: '',
+      speechStyle: '',
+      careStyle: '',
+      relationship: '',
+      extra: '',
+    })
+  }
+
+  function handleSelectCharacter(card: CharacterCard) {
+    setProfile(card.profile)
+    setCurrentCharacterName(card.profile.name)
+    setMessages(loadMessages(card.profile.name))
+    setShowProfileEditor(false)
+  }
+
+  function handleEditCharacter(card: CharacterCard) {
+    setProfile(card.profile)
+    setShowProfileEditor(true)
+  }
+
+  function handleSaveProfile() {
+    localStorage.setItem('profileFields', JSON.stringify(profile))
+    setShowProfileEditor(false)
+
+    const nextName = profile.name.trim()
+    if (!nextName) return
+
+    clearMessages(currentCharacterName)
+    setMessages([])
+    setCurrentCharacterName(nextName)
+
+    const existingCard = cards.find((card) => card.name === nextName)
+
+    if (existingCard) {
+      const nextCards = cards.map((card) =>
+        card.name === nextName ? { ...card, profile } : card
+      )
+      setCards(nextCards)
+      saveCustomCharacterCards(nextCards)
+    } else {
+      const newCard: CharacterCard = {
+        id: crypto.randomUUID(),
+        name: nextName,
+        profile,
+      }
+
+      const nextCards = [...cards, newCard]
+      setCards(nextCards)
+      saveCustomCharacterCards(nextCards)
+    }
+  }
+
+  function handleVoiceInput() {
+    if (listening) {
+      stopSpeechRecognition()
+      setListening(false)
+      return
+    }
+
+    setListening(true)
+    startSpeechRecognition(
+      (text) => {
+        setInput(text)
+        inputRef.current?.focus()
+      },
+      () => setListening(false)
+    )
+  }
+
+  async function handleUploadCharacter(file: File) {
+    const dataUrl = await fileToDataUrl(file)
+    const asset = createAsset(file.name, dataUrl)
+    const next = [...characterAssets, asset]
+    setCharacterAssets(next)
+    saveCharacterImages(next)
+
+    const nextOptions = [...characterOptions, dataUrl]
+    setCharacterOptions(nextOptions)
+    setCharacterIndex(nextOptions.length - 1)
+  }
+
+  async function handleUploadBackground(file: File) {
+    const dataUrl = await fileToDataUrl(file)
+    const asset = createAsset(file.name, dataUrl)
+    const next = [...backgroundAssets, asset]
+    setBackgroundAssets(next)
+    saveBackgroundImages(next)
+
+    const nextOptions = [...backgroundOptions, dataUrl]
+    setBackgroundOptions(nextOptions)
+    setSceneIndex(nextOptions.length - 1)
+  }
+
+  function handleDeleteCharacter(id: string) {
+    const asset = characterAssets.find((item) => item.id === id)
+    if (!asset) return
+
+    const next = characterAssets.filter((item) => item.id !== id)
+    setCharacterAssets(next)
+    saveCharacterImages(next)
+    setCharacterOptions((prev) => prev.filter((img) => img !== asset.dataUrl))
+  }
+
+  function handleDeleteBackground(id: string) {
+    const asset = backgroundAssets.find((item) => item.id === id)
+    if (!asset) return
+
+    const next = backgroundAssets.filter((item) => item.id !== id)
+    setBackgroundAssets(next)
+    saveBackgroundImages(next)
+    setBackgroundOptions((prev) => prev.filter((img) => img !== asset.dataUrl))
+  }
+
+  function handleSaveSettings() {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(llmSettings))
+    setShowSettings(false)
+  }
+
+  return (
+    <>
+      <div className="app">
+        <main className="app-shell">
+          <ScenePanel
+            backgroundImage={currentBackgroundImage}
+            characterImage={currentCharacterImage}
+            replyText={
+              typingMessageId === messages[messages.length - 1]?.id
+                ? typingText
+                : messages[messages.length - 1]?.role === 'assistant'
+                  ? messages[messages.length - 1].content
+                  : ''
+            }
+            isTyping={typingMessageId !== null}
+            voiceEnabled={voiceEnabled}
+            onToggleVoice={() => {
+              setVoiceEnabled((prev) => {
+                const next = !prev
+                if (!next) {
+                  stopSpeechRecognition()
+                }
+                return next
+              })
+            }}
+            t={t}
+          />
+
+          <section className="chat-panel">
+            <div className="chat-window" ref={chatWindowRef}>
+              <ChatWindow
+                messages={messages.filter((message) => message.role === 'user')}
+                typingMessageId={null}
+                typingText=""
+              />
+            </div>
+
+            <InputBar
+              input={input}
+              sending={sending}
+              onChange={setInput}
+              onSend={handleSend}
+              onOpenProfile={() => setShowProfileEditor(true)}
+              onOpenHistory={() => setShowHistory(true)}
+              onOpenSettings={() => setShowSettings(true)}
+              theme={theme}
+              onChangeTheme={setTheme}
+              language={language}
+              onToggleLanguage={() =>
+                setLanguage((prev) => (prev === 'zh' ? 'en' : 'zh'))
+              }
+              t={t}
+              listening={listening}
+              onVoiceInput={handleVoiceInput}
+            />
+          </section>
+        </main>
+      </div>
+
+      {leftPanelOpen && (
+        <AssetLibrary
+          side="left"
+          title="立绘库"
+          accept="image/png"
+          assets={characterAssets}
+          currentImage={currentCharacterImage}
+          onSelect={(asset) => {
+            const next = [...characterOptions]
+            next[characterIndex] = asset.dataUrl
+            setCharacterOptions(next)
+          }}
+          onUpload={handleUploadCharacter}
+          onDelete={handleDeleteCharacter}
+        />
+      )}
+
+      {rightPanelOpen && (
+        <AssetLibrary
+          side="right"
+          title="背景库"
+          accept="image/*"
+          assets={backgroundAssets}
+          currentImage={currentBackgroundImage}
+          onSelect={(asset) => {
+            const next = [...backgroundOptions]
+            next[sceneIndex] = asset.dataUrl
+            setBackgroundOptions(next)
+          }}
+          onUpload={handleUploadBackground}
+          onDelete={handleDeleteBackground}
+        />
+      )}
+
+      <button
+        type="button"
+        className="panel-toggle panel-toggle-left"
+        onClick={() => setLeftPanelOpen((prev) => !prev)}
+      >
+        {leftPanelOpen ? '⟨' : '⟩'}
+      </button>
+
+      <button
+        type="button"
+        className="panel-toggle panel-toggle-right"
+        onClick={() => setRightPanelOpen((prev) => !prev)}
+      >
+        {rightPanelOpen ? '⟩' : '⟨'}
+      </button>
+
+      {showSettings && (
+        <div className="settings-modal">
+          <div className="settings-modal-inner">
+            <h3>{t.settings}</h3>
+
+            <div className="settings-form">
+              <label>
+                API Key
+                <input
+                  type="password"
+                  value={llmSettings.apiKey}
+                  onChange={(event) =>
+                    setLlmSettings((prev) => ({ ...prev, apiKey: event.target.value }))
+                  }
+                />
+              </label>
+
+              <label>
+                Base URL
+                <input
+                  value={llmSettings.baseUrl}
+                  onChange={(event) =>
+                    setLlmSettings((prev) => ({ ...prev, baseUrl: event.target.value }))
+                  }
+                />
+              </label>
+
+              <label>
+                Model
+                <input
+                  value={llmSettings.model}
+                  onChange={(event) =>
+                    setLlmSettings((prev) => ({ ...prev, model: event.target.value }))
+                  }
+                />
+              </label>
+            </div>
+
+            <div className="profile-editor-actions">
+              <button type="button" onClick={() => setShowSettings(false)}>
+                {t.cancel}
+              </button>
+              <button type="button" onClick={handleSaveSettings}>
+                {t.save}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showProfileEditor && (
+        <div className="profile-editor">
+          <div className="profile-editor-inner">
+            <h3>{t.characterProfile}</h3>
+
+            <div className="character-cards">
+              {cards.map((card) => (
+                <button
+                  key={card.id}
+                  type="button"
+                  className="character-card"
+                  onClick={() => handleSelectCharacter(card)}
+                  onContextMenu={(event) => {
+                    event.preventDefault()
+                    handleEditCharacter(card)
+                  }}
+                >
+                  {card.name}
+                </button>
+              ))}
+
+              <button
+                type="button"
+                className="character-card new-character-card"
+                onClick={handleNewCharacter}
+              >
+                + New
+              </button>
+            </div>
+
+            <div className="profile-form">
+              <label>
+                {t.name}
+                <input
+                  value={profile.name}
+                  onChange={(event) => updateProfileField('name', event.target.value)}
+                />
+              </label>
+
+              <label>
+                {t.occupation}
+                <input
+                  value={profile.occupation}
+                  onChange={(event) => updateProfileField('occupation', event.target.value)}
+                />
+              </label>
+
+              <label>
+                {t.personality}
+                <textarea
+                  rows={2}
+                  value={profile.personality}
+                  onChange={(event) => updateProfileField('personality', event.target.value)}
+                />
+              </label>
+
+              <label>
+                {t.speechStyle}
+                <textarea
+                  rows={2}
+                  value={profile.speechStyle}
+                  onChange={(event) => updateProfileField('speechStyle', event.target.value)}
+                />
+              </label>
+
+              <label>
+                {t.careStyle}
+                <textarea
+                  rows={2}
+                  value={profile.careStyle}
+                  onChange={(event) => updateProfileField('careStyle', event.target.value)}
+                />
+              </label>
+
+              <label>
+                {t.relationship}
+                <input
+                  value={profile.relationship}
+                  onChange={(event) => updateProfileField('relationship', event.target.value)}
+                />
+              </label>
+
+              <label>
+                {t.extra}
+                <textarea
+                  rows={4}
+                  placeholder={t.extraPlaceholder}
+                  value={profile.extra}
+                  onChange={(event) => updateProfileField('extra', event.target.value)}
+                />
+              </label>
+            </div>
+
+            <div className="profile-editor-actions">
+              <button type="button" onClick={() => setShowProfileEditor(false)}>
+                {t.cancel}
+              </button>
+              <button type="button" onClick={handleSaveProfile}>
+                {t.save}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showHistory && (
+        <div className="history-modal">
+          <div className="history-modal-inner">
+            <h3>{t.history}</h3>
+
+            <div className="history-list">
+              {messages.length === 0 && <p>{t.emptyHistory}</p>}
+
+              {messages.map((message) => (
+                <div
+                  key={message.id}
+                  className={`history-message history-${message.role}`}
+                >
+                  <div className="history-message-role">
+                    {message.role === 'user' ? t.me : profile.name}
+                  </div>
+                  <div className="history-message-content">{message.content}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="profile-editor-actions">
+              <button type="button" onClick={() => setShowHistory(false)}>
+                {t.cancel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
